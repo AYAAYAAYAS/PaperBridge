@@ -1,0 +1,9 @@
+.venv/
+.pip-cache/
+.build-tmp/
+build/
+dist/
+userdata/
+__pycache__/
+*.pyc
+.ruff_cache/
