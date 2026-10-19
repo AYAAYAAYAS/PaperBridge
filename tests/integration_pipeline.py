@@ -71,9 +71,15 @@ class FixtureAPI(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(json.dumps({"id": "fixture", "object": "chat.completion", "created": 1,
-            "model": "fixture", "choices": [{"index": 0, "message": {"role": "assistant", "content": answer},
-            "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode())
+        if self.path == "/api/chat":
+            payload = {"model": "fixture", "message": {"role": "assistant", "content": answer},
+                       "done": True, "prompt_eval_count": 1, "eval_count": 1}
+        else:
+            payload = {"id": "fixture", "object": "chat.completion", "created": 1,
+                       "model": "fixture", "choices": [{"index": 0, "message": {
+                           "role": "assistant", "content": answer}, "finish_reason": "stop"}],
+                       "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+        self.wfile.write(json.dumps(payload).encode())
 
     def log_message(self, *args):
         pass
@@ -92,7 +98,8 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     settings = dict(DEFAULTS, base_url=f"http://127.0.0.1:{server.server_port}/v1", model="paperbridge-fixture-v1",
                     auto_glossary=False)
-    job = {"source": str(source), "output": str(output), "settings": settings, "key": "", "pages": "1"}
+    job = {"source": str(source), "output": str(output), "settings": settings, "key": "", "pages": "1",
+           "ignore_cache": True}
     try:
         result = subprocess.run([sys.executable, "-u", "-m", "paperbridge.worker"],
                                 input=json.dumps(job) + "\n", capture_output=True, encoding="utf-8", timeout=240, cwd=ROOT)

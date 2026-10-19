@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import hashlib
-from urllib.request import urlopen
+
+from paperbridge.network import urlopen
 
 
 def ensure_tokenizer():

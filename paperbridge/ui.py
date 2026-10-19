@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pymupdf
-from PySide6.QtCore import QPointF, Qt, QTimer, QUrl
+from PySide6.QtCore import QPointF, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -35,12 +35,16 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from paperbridge.core import DATA, atomic_json, parse_pages, read_settings, validate_service, write_settings
+from paperbridge.layout_quality import overlapping_formula_fragments, readable_page_html
 from paperbridge.process import EngineProcess
+from paperbridge.references import extract_references, resolve_reference
 
 LANGUAGES = [("英语", "en"), ("简体中文", "zh-CN"), ("繁体中文", "zh-TW"),
              ("日语", "ja"), ("德语", "de"), ("法语", "fr"), ("韩语", "ko")]
@@ -144,6 +148,8 @@ class SettingsDialog(QDialog):
         self.auto_terms.setChecked(settings["auto_glossary"])
         self.tables = QCheckBox("翻译表格文字（实验功能）")
         self.tables.setChecked(settings["translate_tables"])
+        self.layout_compatibility = QCheckBox("复杂公式兼容模式（可能简化局部字形样式）")
+        self.layout_compatibility.setChecked(settings.get("layout_compatibility", False))
         form.addRow("服务地址", self.url)
         form.addRow("模型名称", self.model)
         form.addRow("API 密钥", self.secret)
@@ -153,6 +159,7 @@ class SettingsDialog(QDialog):
         form.addRow("请求速度", self.rate)
         form.addRow("", self.auto_terms)
         form.addRow("", self.tables)
+        form.addRow("", self.layout_compatibility)
         layout.addLayout(form)
         layout.addWidget(label("点击翻译后，正文与术语会发送至你配置的服务；原 PDF 留在本机。"
                                "使用云端服务会按服务商规则计费。", "muted", True))
@@ -188,7 +195,8 @@ class SettingsDialog(QDialog):
         values.update(base_url=self.url.text().strip(), model=self.model.text().strip(),
                       domain=self.domain.text().strip(), glossary=self.glossary.text().strip(),
                       qps=self.rate.value(), remember_key=self.remember.isChecked(),
-                      auto_glossary=self.auto_terms.isChecked(), translate_tables=self.tables.isChecked())
+                      auto_glossary=self.auto_terms.isChecked(), translate_tables=self.tables.isChecked(),
+                      layout_compatibility=self.layout_compatibility.isChecked())
         return values, self.secret.text().strip()
 
     def test_connection(self):
@@ -245,6 +253,9 @@ class PdfPane(QWidget):
         bar.addStretch()
         self.badge = label(subtitle, "badge")
         bar.addWidget(self.badge)
+        self.layout_button = button("查看原 PDF 排版", self.toggle_layout)
+        self.layout_button.setVisible(False)
+        bar.addWidget(self.layout_button)
         layout.addWidget(header)
         self.stack = QStackedWidget()
         self.empty = QWidget()
@@ -265,6 +276,12 @@ class PdfPane(QWidget):
         self.view.setPageMode(QPdfView.PageMode.SinglePage)
         self.view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
         self.stack.addWidget(self.view)
+        self.clear_view = QTextBrowser(self)
+        self.clear_view.setOpenExternalLinks(False)
+        self.stack.addWidget(self.clear_view)
+        self.quality_pages = {}
+        self.quality_page = None
+        self.show_pdf_layout = False
         layout.addWidget(self.stack)
 
     def load(self, path):
@@ -277,7 +294,48 @@ class PdfPane(QWidget):
 
     def clear(self):
         self.doc.close()
+        self.quality_pages = {}
+        self.quality_page = None
+        self.layout_button.setVisible(False)
         self.stack.setCurrentIndex(0)
+
+    def set_quality_pages(self, pages):
+        self.quality_pages = pages
+        self.quality_page = None
+        self.show_pdf_layout = False
+
+    def show_quality_page(self, page):
+        if page != self.quality_page:
+            self.show_pdf_layout = False
+        self.quality_page = page
+        html = self.quality_pages.get(page)
+        self.layout_button.setVisible(bool(html))
+        if html and not self.show_pdf_layout:
+            self.clear_view.setHtml(html)
+            self.stack.setCurrentWidget(self.clear_view)
+            self.layout_button.setText("查看原 PDF 排版")
+        else:
+            self.stack.setCurrentWidget(self.view)
+            self.layout_button.setText("查看清晰译文")
+
+    def toggle_layout(self):
+        self.show_pdf_layout = not self.show_pdf_layout
+        self.show_quality_page(self.quality_page)
+
+
+class ReferenceLookup(QThread):
+    resolved = Signal(str, str)
+
+    def __init__(self, reference, parent=None):
+        super().__init__(parent)
+        self.reference = reference
+
+    def run(self):
+        try:
+            url = resolve_reference(self.reference)
+            self.resolved.emit(url, "" if url else "未找到足够准确的 DOI，避免打开错误文献。")
+        except (OSError, ValueError) as exc:
+            self.resolved.emit("", "检索失败：" + str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -296,6 +354,7 @@ class MainWindow(QMainWindow):
         self._pending_result = None
         self._error_text = ""
         self._syncing = False
+        self._reference_lookups = []
         self.runner = EngineProcess(self)
         self.runner.event.connect(self.on_event)
         self.runner.log.connect(self.append_log)
@@ -346,10 +405,15 @@ class MainWindow(QMainWindow):
         self.doc_meta = label("支持可选中文字的 PDF", "muted", True)
         side.addWidget(self.doc_meta)
         side.addSpacing(10)
-        side.addWidget(label("文献目录", "section"))
+        side.addWidget(label("文献导航", "section"))
         self.outline = QListWidget()
         self.outline.itemClicked.connect(lambda item: self.page.setValue(item.data(Qt.ItemDataRole.UserRole)))
-        side.addWidget(self.outline, 3)
+        self.references_list = QListWidget()
+        self.references_list.itemClicked.connect(self.open_reference)
+        self.navigation_tabs = QTabWidget()
+        self.navigation_tabs.addTab(self.outline, "目录")
+        self.navigation_tabs.addTab(self.references_list, "参考文献")
+        side.addWidget(self.navigation_tabs, 3)
         side.addWidget(label("最近阅读", "section"))
         self.history_list = QListWidget()
         self.history_list.setMaximumHeight(165)
@@ -425,6 +489,8 @@ class MainWindow(QMainWindow):
         for first, second in ((self.left, self.right), (self.right, self.left)):
             first.view.verticalScrollBar().valueChanged.connect(lambda value, a=first, b=second: self.sync_scroll(a, b, value))
             first.view.pageNavigator().currentPageChanged.connect(self.navigator_changed)
+        self.right.clear_view.verticalScrollBar().valueChanged.connect(
+            lambda value: self.sync_scroll(self.right, self.left, value, from_clear=True))
         bottom = QWidget()
         bottom_layout = QVBoxLayout(bottom)
         bottom_layout.setContentsMargins(20, 12, 20, 12)
@@ -516,6 +582,7 @@ class MainWindow(QMainWindow):
                     raise ValueError("PDF 没有可阅读的页面。")
                 toc = doc.get_toc()
                 scanned = not any(doc[i].get_text().strip() for i in range(min(5, count)))
+                references = extract_references(doc)
             # Validate with a temporary Qt document before replacing the current reader.
             probe = QPdfDocument(self)
             error = probe.load(str(path))
@@ -544,6 +611,14 @@ class MainWindow(QMainWindow):
         self.page.setValue(1)
         self.total_label.setText(f"/ {count} 页")
         self.outline.clear()
+        self.references_list.clear()
+        for reference in references:
+            title = reference.citation
+            item = QListWidgetItem(title[:105] + ("…" if len(title) > 105 else ""))
+            item.setData(Qt.ItemDataRole.UserRole, reference)
+            item.setToolTip(reference.citation + "\n单击打开 DOI 或检索文献页面")
+            self.references_list.addItem(item)
+        self.navigation_tabs.setTabText(1, f"参考文献 ({len(references)})")
         if toc:
             for level, title, page in toc:
                 if page < 1:
@@ -588,13 +663,43 @@ class MainWindow(QMainWindow):
 
     def update_page_badge(self):
         if self.result:
-            self.right.badge.setText("已翻译" if self.page.value() in self.result_pages else "本页未翻译 · 原文")
+            page = self.page.value()
+            self.right.show_quality_page(page)
+            self.right.badge.setText(
+                "版面异常 · 清晰译文" if page in self.right.quality_pages
+                else "已翻译" if page in self.result_pages else "本页未翻译 · 原文"
+            )
 
-    def sync_scroll(self, source, target, value):
+    def open_reference(self, item):
+        reference = item.data(Qt.ItemDataRole.UserRole)
+        if not reference:
+            return
+        if reference.arxiv and not reference.doi:
+            self.on_reference_resolved(reference.direct_url, "")
+            return
+        self.statusBar().showMessage("正在查找参考文献的公开全文页面…")
+        lookup = ReferenceLookup(reference, self)
+        self._reference_lookups.append(lookup)
+        lookup.resolved.connect(self.on_reference_resolved)
+        lookup.finished.connect(lambda: self._reference_lookups.remove(lookup))
+        lookup.start()
+
+    def on_reference_resolved(self, url, error):
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+            self.statusBar().showMessage("已打开参考文献页面：" + url, 8000)
+        else:
+            self.statusBar().showMessage(error, 10000)
+
+    def sync_scroll(self, source, target, value, from_clear=False):
         if not self.sync.isChecked() or self._syncing or not target.doc.pageCount():
             return
+        if source is self.right and source.stack.currentWidget() is source.clear_view and not from_clear:
+            return
         self._syncing = True
-        a, b = source.view.verticalScrollBar(), target.view.verticalScrollBar()
+        a = source.clear_view.verticalScrollBar() if from_clear else source.view.verticalScrollBar()
+        b = (target.clear_view.verticalScrollBar() if target.stack.currentWidget() is target.clear_view
+             else target.view.verticalScrollBar())
         b.setValue(round(value / max(1, a.maximum()) * b.maximum()))
         self._syncing = False
 
@@ -687,7 +792,6 @@ class MainWindow(QMainWindow):
             self._pending_result = event
         elif kind == "error":
             self._error_text = event["message"]
-            self.append_log(self._error_text)
 
     def on_ended(self, code, cancelled):
         self.set_busy(False)
@@ -703,7 +807,20 @@ class MainWindow(QMainWindow):
                 atomic_json(Path(self.job["output"]) / "job.json", manifest)
                 self.remember_document()
                 self.progress.setValue(100)
-                self.job_label.setText(f"翻译完成 · {len(self.result_pages)} 页 · 可导出译文或左右双语 PDF")
+                prompt_tokens = int(self._pending_result.get("prompt_tokens", 0))
+                completion_tokens = int(self._pending_result.get("completion_tokens", 0))
+                cached_tokens = int(self._pending_result.get("cached_tokens", 0))
+                retries = int(self._pending_result.get("empty_retries", 0))
+                usage = ""
+                if prompt_tokens or completion_tokens:
+                    usage = f" · 本次 {prompt_tokens + completion_tokens:,} tokens"
+                    self.append_log(
+                        f"API token：输入 {prompt_tokens:,}，输出 {completion_tokens:,}，"
+                        f"其中缓存命中 {cached_tokens:,}；空响应重试 {retries} 次。"
+                    )
+                self.job_label.setText(
+                    f"翻译完成 · {len(self.result_pages)} 页{usage} · 可导出 PDF"
+                )
                 self.statusBar().showMessage("译文已生成，建议核对术语、公式及复杂图表。")
             except Exception as exc:
                 self._error_text = str(exc)
@@ -725,15 +842,22 @@ class MainWindow(QMainWindow):
 
     def load_result(self, result, selected):
         mono = Path(result["mono"])
+        quality_pages = {}
         with pymupdf.open(mono) as doc:
             if len(doc) != self.page_count:
                 raise ValueError("译文页数与原文不同，无法同步对照。")
+            for number in selected:
+                if 1 <= number <= len(doc) and overlapping_formula_fragments(doc[number - 1]) >= 20:
+                    quality_pages[number] = readable_page_html(doc[number - 1])
         self.right.load(mono)
+        self.right.set_quality_pages(quality_pages)
         self.result = {k: result.get(k, "") for k in ("mono", "dual", "glossary")}
         self.result_pages = selected
         self.export_btn.setEnabled(True)
         self.go_page(self.page.value())
         self.change_zoom(self.zoom.currentIndex())
+        if quality_pages:
+            self.append_log(f"检测到 {len(quality_pages)} 页行内公式可能错位，已提供清晰译文视图；导出的原版面 PDF 仍需核对。")
 
     def append_log(self, text):
         text = text.strip()
@@ -745,7 +869,8 @@ class MainWindow(QMainWindow):
 
     def export_menu(self):
         menu = QMenu(self)
-        for text, key, ext in (("导出译文 PDF", "mono", "pdf"), ("导出左右双语 PDF", "dual", "pdf"),
+        caution = "（异常页需核对）" if self.right.quality_pages else ""
+        for text, key, ext in (("导出译文 PDF" + caution, "mono", "pdf"), ("导出左右双语 PDF" + caution, "dual", "pdf"),
                                ("导出自动提取的术语表", "glossary", "csv")):
             action = menu.addAction(text)
             action.setEnabled(bool(self.result and self.result.get(key) and Path(self.result[key]).is_file()))
@@ -771,7 +896,10 @@ class MainWindow(QMainWindow):
                 raise ValueError("请选择其他文件名，避免覆盖原始文献。")
             if target.resolve() != source.resolve():
                 shutil.copy2(source, target)
-            self.statusBar().showMessage("已导出至 " + str(target), 12000)
+            message = "已导出至 " + str(target)
+            if extension == "pdf" and self.right.quality_pages:
+                message += "；部分页的原版面存在错位，请对照原文核对。"
+            self.statusBar().showMessage(message, 12000)
         except OSError as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
         except ValueError as exc:
@@ -830,6 +958,8 @@ class MainWindow(QMainWindow):
                 return
             self.runner.cancel()
             self.runner.process.waitForFinished(3000)
+        for lookup in self._reference_lookups:
+            lookup.wait(9000)
         self.left.view.setDocument(None)
         self.right.view.setDocument(None)
         self.left.doc.close()
