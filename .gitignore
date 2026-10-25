@@ -4,6 +4,7 @@
 build/
 dist/
 userdata/
+文献库/
 __pycache__/
 *.pyc
 .ruff_cache/

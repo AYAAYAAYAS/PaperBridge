@@ -1,6 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+if exist "%~dp0dist\20261021\PaperBridge\PaperBridge.exe" (
+    start "" "%~dp0dist\20261021\PaperBridge\PaperBridge.exe" %*
+    exit /b
+)
 if exist "%~dp0dist\20261013\PaperBridge\PaperBridge.exe" (
     start "" "%~dp0dist\20261013\PaperBridge\PaperBridge.exe" %*
     exit /b

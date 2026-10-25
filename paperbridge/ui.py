@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 import pymupdf
-from PySide6.QtCore import QPointF, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QEvent, QPointF, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -42,7 +43,11 @@ from PySide6.QtWidgets import (
 )
 
 from paperbridge.core import DATA, atomic_json, parse_pages, read_settings, validate_service, write_settings
+from paperbridge.journal_ui import JournalController
+from paperbridge.journals import ranking_brief, ranking_summary
 from paperbridge.layout_quality import overlapping_formula_fragments, readable_page_html
+from paperbridge.library import PaperLibrary
+from paperbridge.library_ui import LibraryDialog
 from paperbridge.process import EngineProcess
 from paperbridge.references import extract_references, resolve_reference
 
@@ -355,12 +360,19 @@ class MainWindow(QMainWindow):
         self._error_text = ""
         self._syncing = False
         self._reference_lookups = []
+        self.library = PaperLibrary(DATA.parent / "文献库")
+        self.journals = JournalController(self.library, self)
+        self._last_scroll_turn = 0
         self.runner = EngineProcess(self)
         self.runner.event.connect(self.on_event)
         self.runner.log.connect(self.append_log)
         self.runner.ended.connect(self.on_ended)
         self.build_ui()
         self.load_history()
+        self.journals.updated.connect(self.journal_updated)
+        for entry in self.history:
+            if isinstance(entry, dict) and Path(entry.get("source", "")).is_file():
+                self.library.register(entry["source"])
         self.statusBar().showMessage("就绪 · 导入一篇文献，开始对照阅读")
         for shortcut, callback in [("Ctrl+O", self.choose_pdf), ("Ctrl+,", self.open_settings),
                                    ("Alt+Right", lambda: self.turn_page(1)), ("Alt+Left", lambda: self.turn_page(-1))]:
@@ -383,6 +395,8 @@ class MainWindow(QMainWindow):
         row.addWidget(label("知译", "brand"))
         row.addWidget(label("PAPERBRIDGE  /  学术阅读工作台", "muted"))
         row.addStretch()
+        self.library_btn = button("文献管理", self.open_library)
+        row.addWidget(self.library_btn)
         self.import_btn = button("＋  导入 PDF", self.choose_pdf)
         row.addWidget(self.import_btn)
         self.settings_btn = button("翻译设置", self.open_settings)
@@ -404,6 +418,8 @@ class MainWindow(QMainWindow):
         side.addWidget(self.doc_title)
         self.doc_meta = label("支持可选中文字的 PDF", "muted", True)
         side.addWidget(self.doc_meta)
+        self.journal_meta = label("期刊：未填写\n分区：未填写", "muted", True)
+        side.addWidget(self.journal_meta)
         side.addSpacing(10)
         side.addWidget(label("文献导航", "section"))
         self.outline = QListWidget()
@@ -480,6 +496,8 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.left = PdfPane("原文", "ORIGINAL")
         self.right = PdfPane("译文", "待翻译")
+        for widget in (self.left.view, self.right.view, self.right.clear_view):
+            widget.viewport().installEventFilter(self)
         self.splitter.addWidget(self.left)
         self.splitter.addWidget(self.right)
         self.splitter.setSizes([590, 590])
@@ -561,6 +579,59 @@ class MainWindow(QMainWindow):
     def scope_changed(self, index):
         self.pages.setVisible(index == 2)
 
+    def open_library(self):
+        dialog = LibraryDialog(self.library, self, controller=self.journals)
+        if self.source:
+            for row in range(dialog.items.count()):
+                item = dialog.items.item(row)
+                paper = item.data(Qt.ItemDataRole.UserRole)
+                if str(self.source) in (paper["source"], paper.get("managed")):
+                    dialog.items.setCurrentRow(row)
+                    break
+        dialog.exec()
+        self.refresh_history()
+        self.refresh_paper_metadata()
+        if dialog.open_path:
+            match = next((x for x in self.history if x.get("source") == dialog.open_path), {})
+            self.open_pdf(dialog.open_path, match.get("result"), match.get("pages"))
+        dialog.deleteLater()
+
+    def refresh_paper_metadata(self):
+        if self.source:
+            paper = self.library.register(self.source)
+            self.journal_meta.setText(f"期刊：{paper.get('journal') or '未填写'}\n{ranking_brief(paper)}\n分类：{paper.get('category') or '未分类'}")
+            self.journal_meta.setToolTip(ranking_summary(paper) + "\n" + paper.get("ranking_status", ""))
+
+    def journal_updated(self, source):
+        self.refresh_paper_metadata()
+        self.refresh_history()
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Wheel and self.source and not event.modifiers():
+            view = next((v for v in (self.left.view, self.right.view, self.right.clear_view)
+                         if v.viewport() is watched), None)
+            if view:
+                delta = event.angleDelta().y() or event.pixelDelta().y()
+                scroll = view.verticalScrollBar()
+                forward = delta < 0 and scroll.value() >= scroll.maximum()
+                backward = delta > 0 and scroll.value() <= scroll.minimum()
+                direction = 1 if forward else -1 if backward else 0
+                destination = self.page.value() + direction
+                if direction and 1 <= destination <= self.page_count:
+                    if time.monotonic() - self._last_scroll_turn >= 0.6:
+                        self._last_scroll_turn = time.monotonic()
+                        self.page.setValue(destination)
+                        QTimer.singleShot(0, lambda: self.scroll_page_edge(direction))
+                    event.accept()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def scroll_page_edge(self, direction):
+        for pane in (self.left, self.right):
+            view = pane.clear_view if pane.stack.currentWidget() is pane.clear_view else pane.view
+            scroll = view.verticalScrollBar()
+            scroll.setValue(scroll.minimum() if direction > 0 else scroll.maximum())
+
     def choose_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入文献", str(self.source.parent) if self.source else "", "PDF 文献 (*.pdf)")
         if path:
@@ -595,6 +666,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法导入", str(exc))
             return
         self.source = path
+        self.refresh_paper_metadata()
         self.page_count = count
         self.result = None
         self.result_pages = []
@@ -643,6 +715,8 @@ class MainWindow(QMainWindow):
         self.remember_document()
         self.job_label.setText("可能为扫描件：请先使用 OCR 生成文本层。" if scanned else "文献已导入 · 可先选择当前页试译")
         self.statusBar().showMessage(f"已导入 {path.name}")
+        if self.journals.store.config["auto"]:
+            self.journals.submit([self.library.register(path)])
 
     def go_page(self, page):
         if not self.source:
@@ -919,7 +993,10 @@ class MainWindow(QMainWindow):
         for entry in self.history[:10]:
             if not isinstance(entry, dict) or not entry.get("source"):
                 continue
-            item = QListWidgetItem(Path(entry["source"]).stem)
+            paper = next((p for p in self.library.data["papers"].values() if p["source"] == entry["source"]), {})
+            item = QListWidgetItem(Path(entry["source"]).stem + "\n" +
+                                   (paper.get("journal") or "期刊未填写") + " · " +
+                                   ranking_brief(paper).replace("\n", " · "))
             item.setData(Qt.ItemDataRole.UserRole, entry)
             item.setToolTip(entry["source"])
             self.history_list.addItem(item)
@@ -960,6 +1037,10 @@ class MainWindow(QMainWindow):
             self.runner.process.waitForFinished(3000)
         for lookup in self._reference_lookups:
             lookup.wait(9000)
+        if not self.journals.stop():
+            event.ignore()
+            self.statusBar().showMessage("正在结束期刊查询，请稍后再次关闭。")
+            return
         self.left.view.setDocument(None)
         self.right.view.setDocument(None)
         self.left.doc.close()
