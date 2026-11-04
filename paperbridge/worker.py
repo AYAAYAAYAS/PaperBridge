@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shutil
 import sys
 import urllib.error
 import urllib.request
@@ -309,7 +310,14 @@ def translate(job):
     prompt = ACADEMIC_PROMPT
     if settings.get("domain", "").strip():
         prompt += "\nSubject area / terminology guidance: " + settings["domain"].strip()
-    argv = ["babeldoc", "--files", job["source"], "--output", job["output"],
+    source = Path(job["source"])
+    engine_source = source
+    if source.stem != source.stem.rstrip(" ."):
+        staging = Path(job["output"]) / "source"
+        staging.mkdir(parents=True, exist_ok=True)
+        engine_source = staging / (source.stem.rstrip(" .") + ".pdf")
+        shutil.copy2(source, engine_source)
+    argv = ["babeldoc", "--files", str(engine_source), "--output", job["output"],
             "--working-dir", str(Path(job["output"]) / "work"), "--openai",
             "--openai-base-url", url, "--openai-model", model, "--openai-api-key", key,
             "--lang-in", settings["source"], "--lang-out", settings["target"],

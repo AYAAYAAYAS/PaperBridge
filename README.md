@@ -59,3 +59,7 @@
 如果模型下载失败，可重新运行 `.venv\Scripts\python.exe -m paperbridge.assets`。分词资源支持官方仓库备用下载地址，并按 BabelDOC 内置哈希验证完整性。请求失败时检查服务地址、密钥、模型名、额度和请求速度；翻译过程中可以取消。
 
 技术资料：[Qt PDF 组件](https://doc.qt.io/qtforpython-6/PySide6/QtPdfWidgets/QPdfView.html)、[BabelDOC 项目与命令行说明](https://github.com/funstory-ai/BabelDOC)、[PyMuPDF 文档](https://pymupdf.readthedocs.io/en/latest/)。依赖版本固定在 `requirements.txt`。这些第三方组件保留各自许可证；进一步分发时应一并保留相应许可证和通知。
+
+## 笔记
+
+点击顶部“笔记”在原文上画线、拖框标色、点击写批注。可选择颜色、撤销、本页批注列表与导出批注 PDF。笔记自动保存在 userdata/notes，按文献和页码保存，点击“阅读”返回原文 PDF 阅读。导出文件包含 PDF 原生批注，原文件不覆盖。

@@ -33,11 +33,13 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
     QTabWidget,
     QTextBrowser,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -47,7 +49,9 @@ from paperbridge.journal_ui import JournalController
 from paperbridge.journals import ranking_brief, ranking_summary
 from paperbridge.layout_quality import overlapping_formula_fragments, readable_page_html
 from paperbridge.library import PaperLibrary
+from paperbridge.library_tree import LibraryTree
 from paperbridge.library_ui import LibraryDialog
+from paperbridge.notes import NoteEditor
 from paperbridge.process import EngineProcess
 from paperbridge.references import extract_references, resolve_reference
 
@@ -267,10 +271,10 @@ class PdfPane(QWidget):
         empty_layout = QVBoxLayout(self.empty)
         empty_layout.setContentsMargins(48, 40, 48, 40)
         empty_layout.addStretch()
-        self.empty_title = label("译文将在这里呈现", "title", True)
+        self.empty_title = label("待翻译", "title", True)
         self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(self.empty_title)
-        self.empty_text = label("完成翻译后，与左侧原文同步阅读。\n保留页面结构、图表与公式。", "muted", True)
+        self.empty_text = label("", "muted", True)
         self.empty_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_layout.addWidget(self.empty_text)
         empty_layout.addStretch()
@@ -346,7 +350,7 @@ class ReferenceLookup(QThread):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("知译 · PaperBridge — 学术文献对照阅读")
+        self.setWindowTitle("知译")
         self.resize(1480, 960)
         self.setMinimumSize(1080, 720)
         self.setAcceptDrops(True)
@@ -393,7 +397,6 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(24, 17, 24, 17)
         row.setSpacing(16)
         row.addWidget(label("知译", "brand"))
-        row.addWidget(label("PAPERBRIDGE  /  学术阅读工作台", "muted"))
         row.addStretch()
         self.library_btn = button("文献管理", self.open_library)
         row.addWidget(self.library_btn)
@@ -405,6 +408,12 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(False)
         row.addWidget(self.export_btn)
         layout.addWidget(header)
+        translation_bar = QFrame()
+        translation_bar.setObjectName("viewerHeader")
+        translation = QHBoxLayout(translation_bar)
+        translation.setContentsMargins(24, 10, 24, 10)
+        translation.setSpacing(12)
+        layout.addWidget(translation_bar)
         body = QHBoxLayout()
         body.setSpacing(0)
         sidebar = QFrame()
@@ -413,30 +422,29 @@ class MainWindow(QMainWindow):
         side = QVBoxLayout(sidebar)
         side.setContentsMargins(20, 22, 20, 18)
         side.setSpacing(12)
-        side.addWidget(label("当前文献", "section"))
         self.doc_title = label("尚未导入文献", "paperTitle", True)
-        side.addWidget(self.doc_title)
         self.doc_meta = label("支持可选中文字的 PDF", "muted", True)
-        side.addWidget(self.doc_meta)
         self.journal_meta = label("期刊：未填写\n分区：未填写", "muted", True)
-        side.addWidget(self.journal_meta)
-        side.addSpacing(10)
-        side.addWidget(label("文献导航", "section"))
         self.outline = QListWidget()
         self.outline.itemClicked.connect(lambda item: self.page.setValue(item.data(Qt.ItemDataRole.UserRole)))
         self.references_list = QListWidget()
         self.references_list.itemClicked.connect(self.open_reference)
         self.navigation_tabs = QTabWidget()
+        self.navigation_tabs.setDocumentMode(True)
+        self.navigation_tabs.setStyleSheet("QTabWidget::pane {border:0;background:transparent;} QTabBar::tab {background:transparent;border:0;padding:8px 6px;} QTabBar::tab:selected {color:#146b56;border-bottom:2px solid #146b56;} QTreeWidget {background:transparent;border:0;} QTabWidget {background:transparent;}")
         self.navigation_tabs.addTab(self.outline, "目录")
         self.navigation_tabs.addTab(self.references_list, "参考文献")
-        side.addWidget(self.navigation_tabs, 3)
+        self.library_tree = LibraryTree()
+        self.library_tree.reclassify.connect(self.move_library_paper)
+        self.library_tree.setHeaderHidden(True)
+        self.library_tree.itemClicked.connect(self.open_library_item)
+        self.navigation_tabs.addTab(self.library_tree, "文献库")
+        side.addWidget(self.navigation_tabs, 6)
         side.addWidget(label("最近阅读", "section"))
         self.history_list = QListWidget()
-        self.history_list.setMaximumHeight(165)
+        self.history_list.setMaximumHeight(110)
         self.history_list.itemClicked.connect(self.open_recent)
         side.addWidget(self.history_list, 1)
-        side.addSpacing(10)
-        side.addWidget(label("翻译偏好", "section"))
         languages = QHBoxLayout()
         self.source_lang = QComboBox()
         self.target_lang = QComboBox()
@@ -448,32 +456,32 @@ class MainWindow(QMainWindow):
         languages.addWidget(self.source_lang)
         languages.addWidget(label("→", "muted"))
         languages.addWidget(self.target_lang)
-        side.addLayout(languages)
+        translation.addLayout(languages)
         self.scope = QComboBox()
         self.scope.addItems(["翻译全文", "只翻译当前页", "自定义页码"])
         self.scope.currentIndexChanged.connect(self.scope_changed)
-        side.addWidget(self.scope)
+        translation.addWidget(self.scope)
         self.pages = QLineEdit()
         self.pages.setPlaceholderText("例如 1-5,8")
+        self.pages.setMaximumWidth(150)
         self.pages.setVisible(False)
-        side.addWidget(self.pages)
-        self.translate_btn = button("开始学术翻译", self.start_translation, True)
+        translation.addWidget(self.pages)
+        self.translate_btn = button("翻译", self.start_translation, True)
         self.translate_btn.setEnabled(False)
-        side.addWidget(self.translate_btn)
+        translation.addWidget(self.translate_btn)
         self.cancel_btn = button("取消翻译", self.runner.cancel)
         self.cancel_btn.setVisible(False)
-        side.addWidget(self.cancel_btn)
-        side.addWidget(label("保留版式与公式 · 语境翻译\n建议先试译 1–2 页，核对术语。", "muted", True))
+        translation.addWidget(self.cancel_btn)
+        translation.addStretch()
+        self.translate_btn.setToolTip("保留版式与公式；建议先试译 1–2 页，核对术语。")
         body.addWidget(sidebar)
         content = QWidget()
         center = QVBoxLayout(content)
         center.setContentsMargins(0, 0, 0, 0)
         center.setSpacing(0)
-        toolbar = QWidget()
-        nav = QHBoxLayout(toolbar)
-        nav.setContentsMargins(20, 12, 20, 12)
+        nav = translation
         self.filename = label("原文与译文，放在一起读。", "muted")
-        nav.addWidget(self.filename, 1)
+        self.filename.hide()
         nav.addWidget(button("‹", lambda: self.turn_page(-1)))
         self.page = QSpinBox()
         self.page.setRange(1, 1)
@@ -490,11 +498,25 @@ class MainWindow(QMainWindow):
         self.sync = QCheckBox("同步滚动")
         self.sync.setChecked(True)
         nav.addWidget(self.sync)
-        center.addWidget(toolbar)
+        paper_info = QFrame()
+        paper_info.setObjectName("viewerHeader")
+        paper_info_layout = QHBoxLayout(paper_info)
+        paper_info_layout.setContentsMargins(0, 0, 0, 0)
+        for item in (self.doc_title, self.doc_meta, self.journal_meta):
+            item.setWordWrap(False)
+            item.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        paper_info_layout.addWidget(self.doc_title, 2)
+        paper_info_layout.addWidget(self.doc_meta, 1)
+        paper_info_layout.addWidget(self.journal_meta, 6)
         self.reader_stack = QStackedWidget()
         self.reader_stack.addWidget(self.welcome())
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.left = PdfPane("原文", "ORIGINAL")
+        self.left.badge.hide()
+        self.note_editor = NoteEditor(self.left)
+        self.left.stack.addWidget(self.note_editor)
+        self.note_button = button("笔记", self.toggle_notes)
+        translation.addWidget(self.note_button)
         self.right = PdfPane("译文", "待翻译")
         for widget in (self.left.view, self.right.view, self.right.clear_view):
             widget.viewport().installEventFilter(self)
@@ -511,8 +533,9 @@ class MainWindow(QMainWindow):
             lambda value: self.sync_scroll(self.right, self.left, value, from_clear=True))
         bottom = QWidget()
         bottom_layout = QVBoxLayout(bottom)
-        bottom_layout.setContentsMargins(20, 12, 20, 12)
-        bottom_layout.setSpacing(8)
+        bottom_layout.setContentsMargins(20, 6, 20, 6)
+        bottom_layout.setSpacing(4)
+        bottom_layout.addWidget(paper_info)
         info_row = QHBoxLayout()
         self.job_label = label("准备就绪", "muted")
         info_row.addWidget(self.job_label, 1)
@@ -524,7 +547,10 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(5)
-        bottom_layout.addWidget(self.progress)
+        self.progress.hide()
+        self.progress_percent = label("0%", "muted")
+        self.statusBar().addPermanentWidget(self.progress_percent)
+        self.progress.valueChanged.connect(lambda value: self.progress_percent.setText(f"{max(0, value)}%"))
         self.logs = QPlainTextEdit()
         self.logs.setReadOnly(True)
         self.logs.setMaximumBlockCount(800)
@@ -537,44 +563,24 @@ class MainWindow(QMainWindow):
 
     def welcome(self):
         widget = QWidget()
-        outer = QVBoxLayout(widget)
-        outer.setContentsMargins(70, 45, 70, 45)
-        outer.addStretch(2)
-        outer.addWidget(label("READ BEYOND LANGUAGE", "section"))
-        outer.addSpacing(14)
-        title = label("跨越语言，专注研究。", "title")
-        title.setStyleSheet("font-size: 36px; font-weight: 600; color: #193e35;")
-        outer.addWidget(title)
-        outer.addSpacing(10)
-        outer.addWidget(label("原文在左，译文在右。\n在熟悉的论文版面中，读懂每一个论点。", "muted", True))
-        outer.addSpacing(30)
-        start = button("＋  选择一篇 PDF 文献", self.choose_pdf, True)
-        start.setFixedWidth(240)
-        start.setMinimumHeight(48)
-        outer.addWidget(start)
-        outer.addWidget(label("也可以将 PDF 文件拖入窗口  ·  Ctrl + O", "muted"))
-        outer.addSpacing(40)
-        cards = QHBoxLayout()
-        cards.setSpacing(18)
-        for number, title, text in [
-            ("01", "版面保留", "识别分栏、正文与图表，\n在原页面结构中呈现译文。"),
-            ("02", "公式保护", "单独识别数学表达式，\n保留公式内容与符号。"),
-            ("03", "学术语境", "结合段落与专业术语，\n让译文准确、自然。"),
-        ]:
-            frame = QFrame()
-            frame.setStyleSheet("QFrame {background: white; border: 1px solid #e0e8e2; border-radius: 10px;}")
-            box = QVBoxLayout(frame)
-            box.setContentsMargins(20, 20, 20, 20)
-            for text_item, name in ((number, "section"), (title, "paperTitle"), (text, "muted")):
-                item = label(text_item, name, True)
-                item.setStyleSheet("border: none;")
-                box.addWidget(item)
-            cards.addWidget(frame)
-        outer.addLayout(cards)
-        outer.addStretch(3)
-        outer.addWidget(label("首次使用：在「翻译设置」填写服务地址、模型和密钥。\n"
-                              "复杂排版可能出现局部字距或换行调整；扫描件请先进行 OCR。", "muted", True))
+        box = QVBoxLayout(widget)
+        box.addStretch()
+        choose = button("导入 PDF", self.choose_pdf, True)
+        box.addWidget(choose, alignment=Qt.AlignmentFlag.AlignCenter)
+        box.addStretch()
         return widget
+
+    def toggle_notes(self):
+        if not self.source:
+            return
+        if self.left.stack.currentWidget() is self.note_editor:
+            self.left.stack.setCurrentWidget(self.left.view)
+            self.note_button.setText("笔记")
+        else:
+            self.note_editor.load(self.source, DATA / "notes", self.page.value() - 1)
+            self.left.stack.setCurrentWidget(self.note_editor)
+            self.note_editor.set_page(self.page.value() - 1)
+            self.note_button.setText("阅读")
 
     def scope_changed(self, index):
         self.pages.setVisible(index == 2)
@@ -599,7 +605,7 @@ class MainWindow(QMainWindow):
     def refresh_paper_metadata(self):
         if self.source:
             paper = self.library.register(self.source)
-            self.journal_meta.setText(f"期刊：{paper.get('journal') or '未填写'}\n{ranking_brief(paper)}\n分类：{paper.get('category') or '未分类'}")
+            self.journal_meta.setText(f"期刊：{paper.get('journal') or '未填写'} · {ranking_brief(paper).replace(chr(10), ' · ')} · 分类：{paper.get('category') or '未分类'}")
             self.journal_meta.setToolTip(ranking_summary(paper) + "\n" + paper.get("ranking_status", ""))
 
     def journal_updated(self, source):
@@ -666,17 +672,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "无法导入", str(exc))
             return
         self.source = path
+        self.note_button.setText("笔记")
         self.refresh_paper_metadata()
         self.page_count = count
         self.result = None
         self.result_pages = []
         self.right.clear()
         self.right.badge.setText("待翻译")
-        self.right.empty_title.setText("译文将在这里呈现")
-        self.right.empty_text.setText("在左侧选择语言和页码，点击开始学术翻译。\n生成译文后，两侧同步阅读。")
+        self.right.empty_title.setText("待翻译")
+        self.right.empty_text.setText("")
         self.export_btn.setEnabled(False)
         self.doc_title.setText(path.stem)
-        self.doc_meta.setText(f"PDF 文献 · {count} 页\n{path.stat().st_size / 1024 / 1024:.1f} MB")
+        self.doc_meta.setText(f"{count} 页")
         self.filename.setText(path.name)
         self.filename.setToolTip(str(path))
         self.page.setRange(1, count)
@@ -713,7 +720,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.append_log(f"历史译文无法加载：{exc}")
         self.remember_document()
-        self.job_label.setText("可能为扫描件：请先使用 OCR 生成文本层。" if scanned else "文献已导入 · 可先选择当前页试译")
+        self.job_label.setText("可能为扫描件：请先使用 OCR 生成文本层。" if scanned else "已导入")
         self.statusBar().showMessage(f"已导入 {path.name}")
         if self.journals.store.config["auto"]:
             self.journals.submit([self.library.register(path)])
@@ -726,6 +733,8 @@ class MainWindow(QMainWindow):
             if pane.doc.pageCount() >= page:
                 pane.view.pageNavigator().jump(page - 1, QPointF(0, 0))
         self._syncing = False
+        if self.left.stack.currentWidget() is self.note_editor:
+            self.note_editor.set_page(page - 1)
         self.update_page_badge()
 
     def navigator_changed(self, page):
@@ -979,6 +988,51 @@ class MainWindow(QMainWindow):
         except ValueError as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
 
+    def refresh_library_tree(self):
+        self.library_tree.clear()
+        groups = {}
+        for name in self.library.data["categories"] + ["未分类"]:
+            group = QTreeWidgetItem([name])
+            group.setData(0, Qt.ItemDataRole.UserRole + 1, "" if name == "未分类" else name)
+            group.setFlags((group.flags() | Qt.ItemFlag.ItemIsDropEnabled) & ~Qt.ItemFlag.ItemIsDragEnabled)
+            self.library_tree.addTopLevelItem(group)
+            groups[name] = group
+        for paper in self.library.data["papers"].values():
+            category = paper.get("category") or "未分类"
+            if category not in groups:
+                groups[category] = QTreeWidgetItem([category])
+                groups[category].setData(0, Qt.ItemDataRole.UserRole + 1, category)
+                groups[category].setFlags((groups[category].flags() | Qt.ItemFlag.ItemIsDropEnabled) & ~Qt.ItemFlag.ItemIsDragEnabled)
+                self.library_tree.addTopLevelItem(groups[category])
+            item = QTreeWidgetItem([paper["title"]])
+            item.setFlags((item.flags() | Qt.ItemFlag.ItemIsDragEnabled) & ~Qt.ItemFlag.ItemIsDropEnabled)
+            item.setData(0, Qt.ItemDataRole.UserRole, paper["source"])
+            item.setToolTip(0, paper["source"])
+            groups[category].addChild(item)
+        self.library_tree.expandAll()
+
+    def move_library_paper(self, source, category):
+        paper = self.library.data["papers"].get(source)
+        if not paper or paper.get("category", "") == category:
+            return
+        try:
+            self.library.update(paper, paper.get("journal", ""), paper.get("partition", ""), category)
+            self.refresh_history()
+            self.refresh_paper_metadata()
+            self.statusBar().showMessage("已归类至 " + (category or "未分类"), 5000)
+        except (ValueError, OSError) as exc:
+            QMessageBox.warning(self, "归类失败", str(exc))
+
+    def open_library_item(self, item, column=0):
+        source = item.data(0, Qt.ItemDataRole.UserRole)
+        if source:
+            paper = self.library.data["papers"][source]
+            path = source if Path(source).is_file() else paper.get("managed", source)
+            entry = next((x for x in self.history if x.get("source") == source), {})
+            self.open_pdf(path, entry.get("result"), entry.get("pages"))
+        else:
+            item.setExpanded(not item.isExpanded())
+
     def load_history(self):
         try:
             self.history = json.loads((DATA / "history.json").read_text(encoding="utf-8"))
@@ -989,6 +1043,7 @@ class MainWindow(QMainWindow):
         self.refresh_history()
 
     def refresh_history(self):
+        self.refresh_library_tree()
         self.history_list.clear()
         for entry in self.history[:10]:
             if not isinstance(entry, dict) or not entry.get("source"):
