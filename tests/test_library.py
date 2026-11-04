@@ -14,6 +14,28 @@ from paperbridge.ui import MainWindow
 
 
 class LibraryTests(unittest.TestCase):
+    def test_refresh_preserves_collapsed_categories_and_missing_record_can_be_removed(self):
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch("paperbridge.ui.DATA", root / "userdata"):
+                window = MainWindow()
+                window.library.add_category("A")
+                window.library.add_category("B")
+                paper = window.library.register(root / "missing.pdf")
+                window.refresh_history()
+                window.library_tree.topLevelItem(0).setExpanded(False)
+                window.library_tree.topLevelItem(1).setExpanded(True)
+                window.refresh_history()
+                self.assertFalse(window.library_tree.topLevelItem(0).isExpanded())
+                self.assertTrue(window.library_tree.topLevelItem(1).isExpanded())
+                window.remove_library_paper(paper["source"])
+                self.assertNotIn(paper["source"], window.library.data["papers"])
+                window.close()
+                window.deleteLater()
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                app.processEvents()
+
     def test_categories_copy_collision_and_persistence(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

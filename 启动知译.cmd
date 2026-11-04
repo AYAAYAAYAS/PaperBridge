@@ -1,6 +1,10 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+if exist "%~dp0dist\20261104-reader\PaperBridge\PaperBridge.exe" (
+    start "" "%~dp0dist\20261104-reader\PaperBridge\PaperBridge.exe" %*
+    exit /b
+)
 if exist "%~dp0dist\20261104-toolbar\PaperBridge\PaperBridge.exe" (
     start "" "%~dp0dist\20261104-toolbar\PaperBridge\PaperBridge.exe" %*
     exit /b

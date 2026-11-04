@@ -436,6 +436,8 @@ class MainWindow(QMainWindow):
         self.navigation_tabs.addTab(self.references_list, "参考文献")
         self.library_tree = LibraryTree()
         self.library_tree.reclassify.connect(self.move_library_paper)
+        self.library_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.library_tree.customContextMenuRequested.connect(self.library_context_menu)
         self.library_tree.setHeaderHidden(True)
         self.library_tree.itemClicked.connect(self.open_library_item)
         self.navigation_tabs.addTab(self.library_tree, "文献库")
@@ -524,7 +526,19 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.right)
         self.splitter.setSizes([590, 590])
         self.splitter.setChildrenCollapsible(False)
-        self.reader_stack.addWidget(self.splitter)
+        reader_container = QWidget()
+        reader_layout = QHBoxLayout(reader_container)
+        reader_layout.setContentsMargins(0, 0, 0, 0)
+        reader_layout.setSpacing(0)
+        reader_layout.addWidget(self.splitter, 1)
+        self.translation_toggle = button("›", self.toggle_translation_pane)
+        self.translation_toggle.setFixedWidth(24)
+        self.translation_toggle.setStyleSheet("QPushButton {padding:0;border:0;border-left:1px solid #dde5e1;border-radius:0;}")
+        self.translation_toggle.setToolTip("收起译文")
+        reader_layout.addWidget(self.translation_toggle)
+        self._translation_hidden = False
+        self._reader_sizes = [590, 590]
+        self.reader_stack.addWidget(reader_container)
         center.addWidget(self.reader_stack, 1)
         for first, second in ((self.left, self.right), (self.right, self.left)):
             first.view.verticalScrollBar().valueChanged.connect(lambda value, a=first, b=second: self.sync_scroll(a, b, value))
@@ -569,6 +583,19 @@ class MainWindow(QMainWindow):
         box.addWidget(choose, alignment=Qt.AlignmentFlag.AlignCenter)
         box.addStretch()
         return widget
+
+    def toggle_translation_pane(self):
+        if not self._translation_hidden:
+            self._reader_sizes = self.splitter.sizes()
+            self.right.hide()
+            self.translation_toggle.setText("‹")
+            self.translation_toggle.setToolTip("展开译文")
+        else:
+            self.right.show()
+            self.splitter.setSizes(self._reader_sizes)
+            self.translation_toggle.setText("›")
+            self.translation_toggle.setToolTip("收起译文")
+        self._translation_hidden = not self._translation_hidden
 
     def toggle_notes(self):
         if not self.source:
@@ -989,6 +1016,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "导出失败", str(exc))
 
     def refresh_library_tree(self):
+        expanded = {self.library_tree.topLevelItem(i).text(0): self.library_tree.topLevelItem(i).isExpanded()
+                    for i in range(self.library_tree.topLevelItemCount())}
+        selected = self.library_tree.currentItem()
+        selected_source = selected.data(0, Qt.ItemDataRole.UserRole) if selected else None
         self.library_tree.clear()
         groups = {}
         for name in self.library.data["categories"] + ["未分类"]:
@@ -1009,7 +1040,73 @@ class MainWindow(QMainWindow):
             item.setData(0, Qt.ItemDataRole.UserRole, paper["source"])
             item.setToolTip(0, paper["source"])
             groups[category].addChild(item)
-        self.library_tree.expandAll()
+            if paper["source"] == selected_source:
+                self.library_tree.setCurrentItem(item)
+        for name, group in groups.items():
+            group.setExpanded(expanded.get(name, False))
+
+    def library_context_menu(self, position):
+        item = self.library_tree.itemAt(position)
+        source = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not source:
+            return
+        menu = QMenu(self)
+        menu.addAction("重新定位文件", lambda: self.relocate_library_paper(source))
+        menu.addAction("从文献库移除", lambda: self.remove_library_paper(source))
+        menu.exec(self.library_tree.viewport().mapToGlobal(position))
+
+    def remove_library_paper(self, source):
+        paper = self.library.data["papers"].get(source)
+        if not paper:
+            return
+        self.library.data["papers"].pop(source)
+        self.library.save()
+        aliases = {source, paper.get("managed", "")}
+        self.history = [x for x in self.history if x.get("source") not in aliases]
+        atomic_json(DATA / "history.json", self.history)
+        if self.source and str(self.source) in aliases:
+            self.source = None
+            self.result = None
+            self.left.clear()
+            self.right.clear()
+            self.translate_btn.setEnabled(False)
+            self.export_btn.setEnabled(False)
+            self.doc_title.setText("")
+            self.doc_meta.setText("")
+            self.journal_meta.setText("")
+        self.refresh_history()
+        self.statusBar().showMessage("已移除记录，文件和笔记保留。", 5000)
+
+    def relocate_library_paper(self, source):
+        path, _ = QFileDialog.getOpenFileName(self, "重新定位文献", "", "PDF (*.pdf)")
+        if not path:
+            return
+        target = str(Path(path).resolve())
+        if target != source and target in self.library.data["papers"]:
+            QMessageBox.warning(self, "无法定位", "该文件已有文献记录。")
+            return
+        try:
+            with pymupdf.open(target):
+                pass
+            from paperbridge.notes import NoteStore
+            old_notes = NoteStore(DATA / "notes", source)
+            if old_notes.path.is_file():
+                new_notes = NoteStore(DATA / "notes", target)
+                if not new_notes.path.exists():
+                    new_notes.data = dict(old_notes.data, source=target)
+                    new_notes.save()
+            paper = self.library.data["papers"].pop(source)
+            paper["source"] = target
+            self.library.data["papers"][target] = paper
+            self.library.save()
+            for entry in self.history:
+                if entry.get("source") == source:
+                    entry["source"] = target
+            atomic_json(DATA / "history.json", self.history)
+            self.refresh_history()
+            self.open_pdf(target)
+        except (OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "定位失败", str(exc))
 
     def move_library_paper(self, source, category):
         paper = self.library.data["papers"].get(source)
@@ -1028,6 +1125,12 @@ class MainWindow(QMainWindow):
         if source:
             paper = self.library.data["papers"][source]
             path = source if Path(source).is_file() else paper.get("managed", source)
+            if not path or not Path(path).is_file():
+                menu = QMenu(self)
+                menu.addAction("重新定位文件", lambda: self.relocate_library_paper(source))
+                menu.addAction("从文献库移除", lambda: self.remove_library_paper(source))
+                menu.exec(self.library_tree.viewport().mapToGlobal(self.library_tree.visualItemRect(item).center()))
+                return
             entry = next((x for x in self.history if x.get("source") == source), {})
             self.open_pdf(path, entry.get("result"), entry.get("pages"))
         else:
